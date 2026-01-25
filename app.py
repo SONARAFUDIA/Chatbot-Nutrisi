@@ -1,210 +1,454 @@
 import streamlit as st
-import time
+import pandas as pd
 import torch
 from pinecone import Pinecone
 from sentence_transformers import SentenceTransformer
 from transformers import BertTokenizerFast, BertForQuestionAnswering
+from rank_bm25 import BM25Okapi
+import numpy as np
+import time
 
-# ==========================================
-# 1. KONFIGURASI HALAMAN & JUDUL
-# ==========================================
+# ============================================
+# PAGE CONFIG
+# ============================================
+
 st.set_page_config(
-    page_title="Chatbot Gizi Pintar",
+    page_title="Chatbot Gizi & Nutrisi",
     page_icon="🥗",
-    layout="centered"
+    layout="wide",
+    initial_sidebar_state="expanded"
 )
 
-st.title("🥗 Asisten Gizi & Kesehatan")
-st.markdown("---")
+# Custom CSS
 st.markdown("""
-Halo! Saya adalah asisten AI yang dilatih khusus untuk menjawab pertanyaan seputar **gizi, diet, dan kesehatan**.
-Silakan tanya apa saja, misalnya:
-- *"Apa makanan yang baik untuk penderita diabetes?"*
-- *"Bagaimana cara menurunkan berat badan secara alami?"*
-""")
+<style>
+    .main-header {
+        font-size: 2.5rem;
+        font-weight: bold;
+        color: #2E7D32;
+        text-align: center;
+        margin-bottom: 0.5rem;
+    }
+    .sub-header {
+        text-align: center;
+        color: #666;
+        margin-bottom: 2rem;
+    }
+    .source-link {
+        background-color: #e8f5e9;
+        padding: 0.5rem;
+        border-radius: 0.3rem;
+        border-left: 3px solid #4CAF50;
+    }
+</style>
+""", unsafe_allow_html=True)
 
-# ==========================================
-# 2. LOAD RESOURCES (CACHED)
-# Biar gak loading ulang tiap kali user ngetik
-# ==========================================
+# ============================================
+# LOAD RESOURCES (CACHED)
+# ============================================
 
-@st.cache_resource
-def init_pinecone():
-    """Menghubungkan ke Database Pinecone"""
-    # Mengambil API Key dari Secrets (Aman!)
+@st.cache_resource(show_spinner=False)
+def load_resources():
+    """Load all resources: Pinecone, Embedding Model, QA Model, BM25"""
+    
+    # 1. Load Pinecone
     try:
         api_key = st.secrets["PINECONE_API_KEY"]
-    except FileNotFoundError:
-        st.error("⚠️ API Key Pinecone belum disetting di Secrets!")
+    except:
+        st.error("❌ PINECONE_API_KEY tidak ditemukan di secrets!")
         st.stop()
-        
+    
     pc = Pinecone(api_key=api_key)
     index_name = "gizi-knowledge"
     
-    # Cek koneksi ke index
     try:
-        index = pc.Index(index_name)
-        return index
+        pinecone_index = pc.Index(index_name)
     except Exception as e:
-        st.error(f"Gagal konek ke Pinecone: {e}")
+        st.error(f"❌ Gagal koneksi ke Pinecone: {e}")
         st.stop()
-
-@st.cache_resource
-def load_embedding_model():
-    """Load model untuk mengubah pertanyaan user jadi vektor"""
-    # Model ini harus SAMA dengan yang dipakai saat upload data ke Pinecone
-    return SentenceTransformer('sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2')
-
-@st.cache_resource
-def load_qa_model():
-    """Load otak AI (IndoBERT Fine-Tuned) dari Hugging Face"""
-    # GANTI 'username_kamu' dengan username Hugging Face aslimu!
-    model_name = "SonaRFD/indobert-gizi-qa-final" 
+    
+    # 2. Load Embedding Model
+    embedding_model = SentenceTransformer('sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2')
+    
+    # 3. Load QA Model dari Hugging Face
+    model_name = "SonaRFD/indobert-gizi-qa-final"
     
     try:
         tokenizer = BertTokenizerFast.from_pretrained(model_name)
-        model = BertForQuestionAnswering.from_pretrained(model_name)
-        
-        # Gunakan CPU di Streamlit Cloud (Gratis gak dapet GPU)
+        qa_model = BertForQuestionAnswering.from_pretrained(model_name)
         device = "cuda" if torch.cuda.is_available() else "cpu"
-        model.to(device)
-        
-        return tokenizer, model, device
-    except OSError:
-        st.error(f"⚠️ Model '{model_name}' tidak ditemukan di Hugging Face. Pastikan nama repo benar dan public.")
+        qa_model.to(device)
+    except Exception as e:
+        st.error(f"❌ Gagal load model QA: {e}")
         st.stop()
-
-# Load semua komponen
-with st.spinner("Sedang menyiapkan otak AI... (Mohon tunggu sebentar)"):
-    index = init_pinecone()
-    embed_model = load_embedding_model()
-    tokenizer, qa_model, device = load_qa_model()
-
-# ==========================================
-# 3. FUNGSI LOGIKA (RETRIEVAL & READER)
-# ==========================================
-
-def retrieve_documents(query, top_k=3):
-    """Langkah 1: Cari dokumen relevan di Pinecone"""
-    # Ubah pertanyaan teks -> vektor angka
-    query_vector = embed_model.encode(query).tolist()
     
-    # Cari di cloud
-    results = index.query(
+    # 4. Load BM25 data (optional, untuk hybrid search)
+    # Jika Anda punya processed_chunks.csv di repo
+    try:
+        df = pd.read_csv('processed_chunks.csv')
+        tokenized_corpus = [doc.lower().split() for doc in df['text'].tolist()]
+        bm25 = BM25Okapi(tokenized_corpus)
+    except:
+        df = None
+        bm25 = None
+    
+    return pinecone_index, embedding_model, tokenizer, qa_model, device, df, bm25
+
+# ============================================
+# SEARCH FUNCTIONS
+# ============================================
+
+def retrieve_from_pinecone(query, pinecone_index, embedding_model, top_k=3):
+    """Retrieve documents from Pinecone"""
+    query_vector = embedding_model.encode(query).tolist()
+    
+    results = pinecone_index.query(
         vector=query_vector,
         top_k=top_k,
-        include_metadata=True # Wajib True biar teks aslinya kebawa
+        include_metadata=True
     )
     
-    contexts = []
+    docs = []
     for match in results['matches']:
-        if 'text' in match['metadata']: # Pastikan ada metadatanya
-            contexts.append({
+        if 'text' in match['metadata']:
+            docs.append({
                 'text': match['metadata']['text'],
-                'title': match['metadata'].get('title', 'Sumber tidak diketahui'),
+                'title': match['metadata'].get('title', 'Tidak diketahui'),
                 'url': match['metadata'].get('url', '#'),
+                'intent': match['metadata'].get('intent', ''),
                 'score': match['score']
             })
-    return contexts
+    
+    return docs
 
-def extract_answer(question, context):
-    """Langkah 2: Suruh IndoBERT baca konteks dan cari jawaban"""
+def hybrid_retrieve(query, pinecone_index, embedding_model, bm25, df, top_k=5):
+    """Hybrid search: Pinecone + BM25"""
+    
+    # Dense retrieval (Pinecone)
+    dense_docs = retrieve_from_pinecone(query, pinecone_index, embedding_model, top_k * 2)
+    
+    if bm25 is None or df is None:
+        return dense_docs[:top_k]
+    
+    # BM25 retrieval
+    tokenized_query = query.lower().split()
+    bm25_scores = bm25.get_scores(tokenized_query)
+    top_bm25_indices = np.argsort(bm25_scores)[::-1][:top_k * 2]
+    
+    # Combine scores
+    combined = {}
+    
+    for doc in dense_docs:
+        # Use text as key (simplified)
+        key = doc['text'][:50]
+        combined[key] = {
+            'doc': doc,
+            'score': 0.6 * doc['score']
+        }
+    
+    for idx in top_bm25_indices:
+        key = df.iloc[idx]['text'][:50]
+        bm25_score = float(bm25_scores[idx])
+        
+        if key in combined:
+            combined[key]['score'] += 0.4 * bm25_score
+        else:
+            combined[key] = {
+                'doc': {
+                    'text': df.iloc[idx]['text'],
+                    'title': df.iloc[idx]['title'],
+                    'url': df.iloc[idx]['url'],
+                    'intent': df.iloc[idx]['intent'],
+                    'score': bm25_score
+                },
+                'score': 0.4 * bm25_score
+            }
+    
+    sorted_results = sorted(combined.values(), key=lambda x: x['score'], reverse=True)
+    return [item['doc'] for item in sorted_results[:top_k]]
+
+def extract_answer_qa(question, context, tokenizer, qa_model, device):
+    """Extract answer using QA model"""
     inputs = tokenizer(
-        question, 
-        context, 
-        return_tensors='pt', 
-        truncation=True, 
-        max_length=512
+        question,
+        context,
+        truncation=True,
+        max_length=512,
+        return_tensors='pt'
     ).to(device)
     
     with torch.no_grad():
         outputs = qa_model(**inputs)
     
-    # Ambil posisi start dan end dengan probabilitas tertinggi
-    start_idx = torch.argmax(outputs.start_logits)
-    end_idx = torch.argmax(outputs.end_logits)
+    start_idx = torch.argmax(outputs.start_logits[0]).item()
+    end_idx = torch.argmax(outputs.end_logits[0]).item()
     
-    # Validasi: Jika posisi start > end, berarti model bingung
-    if start_idx > end_idx:
-        return None, 0.0
-
-    # Hitung confidence score sederhana
-    confidence = (torch.max(torch.softmax(outputs.start_logits, dim=1)) * torch.max(torch.softmax(outputs.end_logits, dim=1))).item()
-
-    # Convert token ID kembali ke kata-kata
+    start_probs = torch.softmax(outputs.start_logits[0], dim=0)
+    end_probs = torch.softmax(outputs.end_logits[0], dim=0)
+    confidence = (start_probs[start_idx] * end_probs[end_idx]).item()
+    
+    if start_idx > end_idx or start_idx == 0:
+        return None, confidence
+    
     tokens = tokenizer.convert_ids_to_tokens(inputs['input_ids'][0])
-    answer = tokenizer.convert_tokens_to_string(tokens[start_idx:end_idx+1])
-    
-    # Bersihkan sisa-sisa token aneh (seperti ##)
-    answer = answer.replace('##', '')
+    answer = tokenizer.convert_tokens_to_string(tokens[start_idx:end_idx + 1])
+    answer = answer.replace('##', '').strip()
     
     return answer, confidence
 
-# ==========================================
-# 4. USER INTERFACE (CHAT)
-# ==========================================
-
-# Form input agar user bisa tekan Enter
-with st.form(key='search_form'):
-    query = st.text_input("Tulis pertanyaanmu di sini:", placeholder="Contoh: Apa bahaya makan gorengan?")
-    submit_button = st.form_submit_button(label='Tanya Dokter AI 🤖')
-
-if submit_button and query:
-    if len(query) < 3:
-        st.warning("Pertanyaan terlalu pendek, tolong lengkapi ya.")
+def search_pipeline(question, pinecone_index, embedding_model, tokenizer, qa_model, 
+                   device, df, bm25, mode='search_engine', threshold=0.1, top_k=3):
+    """Main search pipeline"""
+    
+    # Retrieve documents
+    if bm25 is not None:
+        retrieved_docs = hybrid_retrieve(question, pinecone_index, embedding_model, bm25, df, top_k)
     else:
-        start_time = time.time()
+        retrieved_docs = retrieve_from_pinecone(question, pinecone_index, embedding_model, top_k)
+    
+    if not retrieved_docs:
+        return {
+            'answer': 'Informasi tidak ditemukan dalam basis pengetahuan.',
+            'source': None,
+            'confidence': 0.0,
+            'intent': None,
+            'all_results': []
+        }
+    
+    if mode == 'search_engine':
+        # Search engine mode: return snippet
+        best_doc = retrieved_docs[0]
+        snippet = best_doc['text'][:400] + "..." if len(best_doc['text']) > 400 else best_doc['text']
         
-        # 1. RETRIEVAL
-        with st.status("🔍 Sedang mencari artikel relevan...", expanded=True) as status:
-            st.write("Menghubungi Pinecone...")
-            retrieved_docs = retrieve_documents(query)
+        response = (
+            f"📄 **{best_doc['title']}**\n\n"
+            f"{snippet}\n\n"
+            f"_Untuk informasi lengkap, kunjungi sumber artikel._"
+        )
+        
+        return {
+            'answer': response,
+            'source': best_doc['url'],
+            'confidence': best_doc['score'],
+            'intent': best_doc.get('intent', ''),
+            'all_results': retrieved_docs
+        }
+    
+    else:
+        # QA mode: extract answer
+        best_answer = None
+        best_confidence = 0
+        best_doc = None
+        
+        for doc in retrieved_docs:
+            answer, conf = extract_answer_qa(question, doc['text'], tokenizer, qa_model, device)
             
-            if not retrieved_docs:
-                status.update(label="Gagal", state="error")
-                st.error("Maaf, saya tidak menemukan informasi yang relevan di database.")
-            else:
-                st.write(f"✅ Ditemukan {len(retrieved_docs)} referensi.")
-                
-                # 2. READER (Cari jawaban terbaik dari dokumen yang ditemukan)
-                st.write("📖 Sedang membaca dan menganalisis...")
-                
-                best_answer = None
-                best_score = -1
-                best_source = None
-                
-                # Cek satu per satu dokumen yang didapat
-                for doc in retrieved_docs:
-                    ans, conf = extract_answer(query, doc['text'])
-                    
-                    # Logika memilih jawaban terbaik (Confidence harus > 10%)
-                    if ans and conf > best_score and conf > 0.1 and "[CLS]" not in ans:
-                        best_answer = ans
-                        best_score = conf
-                        best_source = doc
-                
-                status.update(label="Selesai!", state="complete", expanded=False)
-                
-                # 3. TAMPILKAN HASIL
-                st.divider()
-                
-                if best_answer:
-                    st.subheader("💡 Jawaban:")
-                    st.success(best_answer.capitalize())
-                    
-                    # Tampilkan Data Pendukung
-                    with st.expander("Lihat Sumber & Konteks Asli"):
-                        st.markdown(f"**Sumber:** [{best_source['title']}]({best_source['url']})")
-                        st.markdown(f"**Relevansi:** {best_score:.2%}")
-                        st.info(f"**Kutipan Teks:**\n\n...{best_source['text']}...")
-                        
-                else:
-                    # Fallback jika Retrieval dapat, tapi Reader bingung (skor rendah)
-                    st.warning("Saya menemukan artikel yang mungkin relevan, tapi saya kurang yakin jawaban pastinya di bagian mana.")
-                    st.markdown("**Coba baca artikel ini langsung:**")
-                    for doc in retrieved_docs[:2]:
-                         st.markdown(f"- [{doc['title']}]({doc['url']})")
+            if answer and conf > best_confidence and conf > threshold:
+                best_answer = answer
+                best_confidence = conf
+                best_doc = doc
+        
+        if best_answer:
+            response = f"Berdasarkan artikel \"{best_doc['title']}\".\n\n{best_answer}"
+        else:
+            response = 'Informasi tidak ditemukan dalam basis pengetahuan.'
+            best_doc = None
+        
+        return {
+            'answer': response,
+            'source': best_doc['url'] if best_doc else None,
+            'confidence': best_confidence,
+            'intent': best_doc.get('intent', '') if best_doc else None,
+            'all_results': retrieved_docs
+        }
 
-        # Footer waktu eksekusi
-        end_time = time.time()
-        st.caption(f"Waktu proses: {end_time - start_time:.2f} detik")
+# ============================================
+# LOAD RESOURCES
+# ============================================
+
+with st.spinner("🔄 Memuat sistem..."):
+    pinecone_index, embedding_model, tokenizer, qa_model, device, df, bm25 = load_resources()
+
+# ============================================
+# UI LAYOUT
+# ============================================
+
+# Header
+st.markdown('<div class="main-header">🥗 Chatbot Gizi & Nutrisi</div>', unsafe_allow_html=True)
+st.markdown('<div class="sub-header">Asisten Pencarian Informasi Kesehatan, Gizi, Diet, dan Nutrisi</div>', unsafe_allow_html=True)
+
+# Sidebar
+with st.sidebar:
+    st.header("⚙️ Pengaturan")
+    
+    # Mode selection
+    search_mode = st.radio(
+        "Mode Pencarian",
+        options=['search_engine', 'qa_model'],
+        format_func=lambda x: "Search Engine (Snippet)" if x == 'search_engine' else "QA Model (Extract Answer)",
+        index=0,
+        help="Search Engine: Tampilkan snippet. QA Model: Ekstrak jawaban spesifik."
+    )
+    
+    st.divider()
+    
+    # Parameters
+    st.subheader("🎚️ Parameters")
+    
+    threshold = st.slider(
+        "Confidence Threshold",
+        min_value=0.0,
+        max_value=1.0,
+        value=0.1,
+        step=0.05,
+        help="Minimum confidence untuk menampilkan hasil"
+    )
+    
+    top_k = st.slider(
+        "Jumlah Hasil",
+        min_value=1,
+        max_value=10,
+        value=3,
+        step=1
+    )
+    
+    st.divider()
+    
+    # Statistics
+    st.subheader("📊 Info Sistem")
+    st.info(f"**Mode:** {search_mode}")
+    st.info(f"**Device:** {device.upper()}")
+    st.info(f"**Hybrid Search:** {'✅' if bm25 is not None else '❌'}")
+
+# Main content
+col_main, col_side = st.columns([2, 1])
+
+with col_main:
+    st.header("💬 Pencarian")
+    
+    # Initialize session state
+    if 'messages' not in st.session_state:
+        st.session_state.messages = []
+    
+    # Display chat history
+    for message in st.session_state.messages:
+        with st.chat_message(message["role"]):
+            st.markdown(message["content"])
+            
+            if message["role"] == "assistant" and "metadata" in message:
+                meta = message["metadata"]
+                
+                if meta.get('source'):
+                    with st.expander("📎 Sumber & Detail"):
+                        st.markdown(f"**Confidence:** `{meta['confidence']:.2%}`")
+                        if meta.get('intent'):
+                            st.markdown(f"**Topik:** `{meta['intent']}`")
+                        st.markdown(f'<div class="source-link">🔗 <a href="{meta["source"]}" target="_blank">{meta["source"]}</a></div>', 
+                                  unsafe_allow_html=True)
+                        
+                        if meta.get('all_results') and len(meta['all_results']) > 1:
+                            st.markdown("**📚 Hasil Lainnya:**")
+                            for i, doc in enumerate(meta['all_results'][1:], 2):
+                                st.caption(f"{i}. {doc['title']} (Score: {doc['score']:.2f})")
+    
+    # Chat input
+    if question := st.chat_input("🔍 Cari informasi gizi, nutrisi, diet, atau kesehatan..."):
+        # Add user message
+        st.session_state.messages.append({"role": "user", "content": question})
+        
+        with st.chat_message("user"):
+            st.markdown(question)
+        
+        # Get response
+        with st.chat_message("assistant"):
+            with st.spinner("🔍 Mencari informasi..."):
+                start_time = time.time()
+                
+                result = search_pipeline(
+                    question,
+                    pinecone_index,
+                    embedding_model,
+                    tokenizer,
+                    qa_model,
+                    device,
+                    df,
+                    bm25,
+                    mode=search_mode,
+                    threshold=threshold,
+                    top_k=top_k
+                )
+                
+                search_time = time.time() - start_time
+                
+                st.markdown(result['answer'])
+                
+                if result['source']:
+                    with st.expander("📎 Sumber & Detail", expanded=True):
+                        st.markdown(f"**Confidence:** `{result['confidence']:.2%}`")
+                        if result.get('intent'):
+                            st.markdown(f"**Topik:** `{result['intent']}`")
+                        st.markdown(f"**Waktu:** `{search_time:.2f}s`")
+                        st.markdown(f'<div class="source-link">🔗 <a href="{result["source"]}" target="_blank">{result["source"]}</a></div>', 
+                                  unsafe_allow_html=True)
+                        
+                        if len(result['all_results']) > 1:
+                            st.markdown("**📚 Hasil Lainnya:**")
+                            for i, doc in enumerate(result['all_results'][1:], 2):
+                                st.caption(f"{i}. {doc['title']} (Score: {doc['score']:.2f})")
+                
+                st.session_state.messages.append({
+                    "role": "assistant",
+                    "content": result['answer'],
+                    "metadata": {
+                        "confidence": result['confidence'],
+                        "source": result['source'],
+                        "intent": result.get('intent'),
+                        "all_results": result['all_results']
+                    }
+                })
+
+with col_side:
+    st.header("📚 Contoh Pencarian")
+    
+    examples = {
+        "🍎 Fakta Gizi": [
+            "Kandungan gizi telur",
+            "Kalori nasi putih",
+            "Manfaat vitamin C"
+        ],
+        "⚖️ Diet": [
+            "Cara menurunkan berat badan",
+            "Penyebab perut buncit",
+            "Makanan untuk diet"
+        ],
+        "💪 Kesehatan": [
+            "Penyebab anemia",
+            "Makanan untuk ibu hamil",
+            "Gejala diabetes"
+        ]
+    }
+    
+    for category, questions in examples.items():
+        with st.expander(f"**{category}**"):
+            for q in questions:
+                if st.button(q, key=q, use_container_width=True):
+                    st.session_state.messages.append({"role": "user", "content": q})
+                    st.rerun()
+    
+    st.divider()
+    if st.button("🗑️ Clear Chat", type="secondary", use_container_width=True):
+        st.session_state.messages = []
+        st.rerun()
+
+# Footer
+st.divider()
+st.markdown(
+    """
+    <div style='text-align: center; color: gray; font-size: 0.85em;'>
+        <strong>Chatbot Gizi & Nutrisi</strong><br>
+        Powered by Pinecone · IndoBERT · Hugging Face<br>
+        ⚠️ <em>Informasi bersifat edukatif. Konsultasi dengan ahli untuk saran personal.</em>
+    </div>
+    """,
+    unsafe_allow_html=True
+)

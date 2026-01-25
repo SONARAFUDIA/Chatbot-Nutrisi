@@ -3,3 +3,6 @@ pinecone
 sentence-transformers
 transformers
 torch
+rank-bm25
+pandas
+numpy
