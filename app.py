@@ -59,7 +59,6 @@ def load_embedding_model():
 def load_qa_model():
     """Load otak AI (IndoBERT Fine-Tuned) dari Hugging Face"""
     # GANTI 'username_kamu' dengan username Hugging Face aslimu!
-    # Contoh: "budi_santoso/indobert-gizi-qa-final"
     model_name = "username_kamu/indobert-gizi-qa-final" 
     
     try:
