@@ -53,13 +53,13 @@ def init_pinecone():
 def load_embedding_model():
     """Load model untuk mengubah pertanyaan user jadi vektor"""
     # Model ini harus SAMA dengan yang dipakai saat upload data ke Pinecone
-    return SentenceTransformer('LazarusNLP/all-indobert-base-v2')
+    return SentenceTransformer('sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2')
 
 @st.cache_resource
 def load_qa_model():
     """Load otak AI (IndoBERT Fine-Tuned) dari Hugging Face"""
     # GANTI 'username_kamu' dengan username Hugging Face aslimu!
-    model_name = "username_kamu/indobert-gizi-qa-final" 
+    model_name = "SonaRFD/indobert-gizi-qa-final" 
     
     try:
         tokenizer = BertTokenizerFast.from_pretrained(model_name)
